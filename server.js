@@ -3,7 +3,7 @@ const { readFile, writeFile, mkdir } = require("fs/promises");
 const path = require("path");
 
 const PORT = Number(process.env.PORT || 3021);
-const DB_FILE = path.join(__dirname, "data", "db.json");
+const DB_FILE = process.env.DB_FILE || path.join(__dirname, "data", "db.json");
 
 const initialData = {
   clocks: [
@@ -39,7 +39,8 @@ const initialData = {
       qualified: false,
       note: "仍偏快，振幅尚可"
     }
-  ]
+  ],
+  corrections: []
 };
 
 const routes = [
@@ -52,7 +53,11 @@ const routes = [
   "POST /clocks/:id/retests",
   "GET /clocks/:id/latest-retest",
   "GET /adjustments",
-  "GET /retests"
+  "GET /retests",
+  "POST /retests/:id/corrections",
+  "GET /retests/:id/corrections",
+  "POST /corrections/:id/void",
+  "GET /corrections"
 ];
 
 async function ensureDb() {
@@ -66,7 +71,9 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  if (!Array.isArray(db.corrections)) db.corrections = [];
+  return db;
 }
 
 async function writeDb(data) {
@@ -114,10 +121,44 @@ function findClock(db, clockId) {
   return clock;
 }
 
+function conflict(message) {
+  const error = new Error(message);
+  error.status = 409;
+  throw error;
+}
+
+function correctionsFor(db, retestId) {
+  return db.corrections
+    .filter((item) => item.retestId === retestId)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+}
+
+// 原记录保留但不参与当前判断：有效值取最后一条未作废更正，无更正则用原值
+function effectiveRetest(db, retest) {
+  const corrections = correctionsFor(db, retest.id);
+  const active = corrections.filter((item) => !item.voided);
+  const last = active[active.length - 1];
+  if (!last) return { ...retest, corrected: false, corrections };
+  return {
+    ...retest,
+    dailyRateSeconds: last.dailyRateSeconds,
+    amplitude: last.amplitude,
+    qualified: last.qualified,
+    corrected: true,
+    original: {
+      dailyRateSeconds: retest.dailyRateSeconds,
+      amplitude: retest.amplitude,
+      qualified: retest.qualified
+    },
+    corrections
+  };
+}
+
 function latestRetest(db, clockId) {
-  return db.retests
+  const retest = db.retests
     .filter((item) => item.clockId === clockId)
     .sort((a, b) => new Date(b.testedAt) - new Date(a.testedAt))[0] || null;
+  return retest ? effectiveRetest(db, retest) : null;
 }
 
 function latestAdjustment(db, clockId) {
@@ -182,8 +223,11 @@ async function handle(req, res) {
   if (historyMatch && req.method === "GET") {
     const clock = findClock(db, historyMatch[1]);
     const adjustments = db.adjustments.filter((item) => item.clockId === clock.id);
-    const retests = db.retests.filter((item) => item.clockId === clock.id);
-    return send(res, 200, { data: { clock, adjustments, retests, latestRetest: latestRetest(db, clock.id) } });
+    const retests = db.retests
+      .filter((item) => item.clockId === clock.id)
+      .map((item) => effectiveRetest(db, item));
+    const corrections = db.corrections.filter((item) => item.clockId === clock.id);
+    return send(res, 200, { data: { clock, adjustments, retests, corrections, latestRetest: latestRetest(db, clock.id) } });
   }
 
   const adjustmentMatch = pathname.match(/^\/clocks\/([^/]+)\/adjustments$/);
@@ -243,10 +287,86 @@ async function handle(req, res) {
   if (req.method === "GET" && pathname === "/retests") {
     const clockId = url.searchParams.get("clockId");
     const qualified = url.searchParams.get("qualified");
-    const data = db.retests.filter((item) => {
+    const data = db.retests
+      .map((item) => effectiveRetest(db, item))
+      .filter((item) => {
+        const matchClock = !clockId || item.clockId === clockId;
+        const matchQualified = qualified === null || item.qualified === (qualified === "true");
+        return matchClock && matchQualified;
+      });
+    return send(res, 200, { data });
+  }
+
+  const correctionMatch = pathname.match(/^\/retests\/([^/]+)\/corrections$/);
+  if (correctionMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    const retestId = correctionMatch[1];
+    const retest = db.retests.find((item) => item.id === retestId);
+    if (!retest) {
+      if (db.corrections.some((item) => item.id === retestId)) {
+        conflict("更正不能指向另一条更正，必须指向原始复测记录");
+      }
+      conflict("指向的原始复测记录不存在");
+    }
+    const missing = ["reason", "dailyRateSeconds", "amplitude", "recordedBy"].filter(
+      (field) => body[field] === undefined || body[field] === ""
+    );
+    if (missing.length) conflict(`缺少字段：${missing.join(", ")}`);
+    const dailyRateSeconds = Number(body.dailyRateSeconds);
+    const amplitude = Number(body.amplitude);
+    if (!Number.isFinite(dailyRateSeconds) || !Number.isFinite(amplitude)) {
+      conflict("新日差和振幅必须是数字");
+    }
+    const clock = findClock(db, retest.clockId);
+    const correction = {
+      id: makeId("correction"),
+      retestId: retest.id,
+      clockId: retest.clockId,
+      reason: body.reason,
+      dailyRateSeconds,
+      amplitude,
+      qualified: body.qualified !== undefined
+        ? Boolean(body.qualified)
+        : Math.abs(dailyRateSeconds) <= Number(clock.targetDailyRateSeconds),
+      recordedBy: body.recordedBy,
+      voided: false,
+      createdAt: new Date().toISOString(),
+      voidedAt: null
+    };
+    db.corrections.push(correction);
+    await writeDb(db);
+    return send(res, 201, { data: correction, retest: effectiveRetest(db, retest), clock: clockSummary(db, clock) });
+  }
+
+  if (correctionMatch && req.method === "GET") {
+    const retest = db.retests.find((item) => item.id === correctionMatch[1]);
+    if (!retest) return send(res, 404, { error: "复测记录不存在" });
+    return send(res, 200, { data: correctionsFor(db, retest.id) });
+  }
+
+  const voidMatch = pathname.match(/^\/corrections\/([^/]+)\/void$/);
+  if (voidMatch && req.method === "POST") {
+    const correction = db.corrections.find((item) => item.id === voidMatch[1]);
+    if (!correction) return send(res, 404, { error: "更正记录不存在" });
+    if (correction.voided) conflict("该更正已作废");
+    const active = correctionsFor(db, correction.retestId).filter((item) => !item.voided);
+    const last = active[active.length - 1];
+    if (!last || last.id !== correction.id) conflict("只能作废最后一条有效更正");
+    correction.voided = true;
+    correction.voidedAt = new Date().toISOString();
+    await writeDb(db);
+    const retest = db.retests.find((item) => item.id === correction.retestId);
+    const clock = findClock(db, retest.clockId);
+    return send(res, 200, { data: correction, retest: effectiveRetest(db, retest), clock: clockSummary(db, clock) });
+  }
+
+  if (req.method === "GET" && pathname === "/corrections") {
+    const clockId = url.searchParams.get("clockId");
+    const retestId = url.searchParams.get("retestId");
+    const data = db.corrections.filter((item) => {
       const matchClock = !clockId || item.clockId === clockId;
-      const matchQualified = qualified === null || item.qualified === (qualified === "true");
-      return matchClock && matchQualified;
+      const matchRetest = !retestId || item.retestId === retestId;
+      return matchClock && matchRetest;
     });
     return send(res, 200, { data });
   }
